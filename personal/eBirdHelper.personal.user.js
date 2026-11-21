@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         eBird 添加中文鸟名（个人内嵌版）
 // @namespace    http://tampermonkey.net/
-// @version      2.1.1-personal.1
-// @description  中文鸟名、拼音搜索及未见鸟种高亮；保留一国特有种，无远程数据请求
+// @version      2.1.1-personal.2
+// @description  中文鸟名、拼音搜索及全球和北京新种高亮，数据内嵌
 // @match        https://ebird.org/*
 // @grant        GM.getValue
 // @downloadURL  none
@@ -143742,7 +143742,7 @@ function buildBirdNamePatternFromMap(map = {}) {
 }
 
 const birdNamePattern = buildBirdNamePatternFromMap(birdMap);
-const markedSet = new WeakSet(); // ✅ 缓存机制：已处理元素集合
+const markedSet = new WeakMap(); // ✅ 缓存机制：已处理元素集合
 
 const style = document.createElement('style');
 
@@ -143766,69 +143766,106 @@ function loadSpeciesList() {
     return data ? JSON.parse(data) : [];
 }
 
-/**
- * 解析生涯列表页面（/lifelist）并把页面上的种类同步到本地缓存。
- * 这样高亮逻辑就可以在其它页面使用一致的数据源。
- */
-function updateSpeciesFromLifelistPage() {
-    const existing = loadSpeciesList(); // [{ commonName, latinName }, ...]
-    const existingSet = new Set(existing.map(s => s.commonName));
+const BEIJING_REGION = 'CN-11';
+const BEIJING_STORAGE_KEY = 'ebirdSpeciesListCN-11';
+const BEIJING_NEW_COLOR = '#16734B';
+// const BEIJING_NEW_COLOR = '#8A6500'; // 北京新种的备选深黄色
 
-    // 仅在 #nativeNatProv 作用域内匹配
-    const scope = document.querySelector('section#nativeNatProv');
-    if (!scope) {
-        console.warn('[eBird Species Tracker] 未找到 <section id="nativeNatProv">，已跳过更新。');
-        return;
+const speciesByCode = new Map();
+const speciesByLatin = new Map();
+for (const [name, info] of Object.entries(pinyin_map)) {
+    if (!Object.hasOwn(birdMap, name)) continue;
+    speciesByCode.set(info.code, name);
+    speciesByLatin.set(info.latin, name);
+}
+
+function speciesCode(el) {
+    const link = el.closest('a') || el.querySelector('a[href*="/species/"]');
+    return el.closest('[data-species-code]')?.dataset.speciesCode ||
+        link?.getAttribute('href')?.match(/\/species\/([^/?#]+)/)?.[1];
+}
+
+function speciesName(commonName, latinName, code) {
+    return speciesByCode.get(code) || speciesByLatin.get(latinName) || commonName;
+}
+
+function isNonSpecies(el, commonName, latinName) {
+    if (/未识别的|×|[（(]\s*杂交\s*[）)]|\s[xX]\s|\bsp\./.test(commonName) ||
+        commonName.includes('/') ||
+        /\bsp\.|\s[a-z-]*\s*\/\s*[A-Za-z*'-]|\b[A-Z][a-z]*\s+[a-z-]+\s+x\s+[a-z-]+\b/.test(latinName)) {
+        return true;
+    }
+    const title = el.matches('.SpecimenHeader-joined') ? el.querySelector('.Species-common, .SpecimenHeader-name, .Heading-main') || el : el;
+    const weight = getComputedStyle(title).fontWeight;
+    return weight === 'normal' || (weight !== '' && Number(weight) < 600);
+}
+
+function loadBeijingSpecies() {
+    return JSON.parse(localStorage.getItem(BEIJING_STORAGE_KEY) || '[]');
+}
+
+function speciesMap(list) {
+    return new Map(list.map(({ commonName, latinName }) => [speciesName(commonName, latinName), latinName]));
+}
+
+function sortedSpecies(map) {
+    return Array.from(map, ([commonName, latinName]) => ({ commonName, latinName }))
+        .sort((a, b) => a.commonName.localeCompare(b.commonName));
+}
+
+function lifelistRegion() {
+    const url = new URL(location.href);
+    if (url.origin !== 'https://ebird.org' || !/^\/lifelist\/?$/.test(url.pathname) ||
+        !['', 'life'].includes(url.searchParams.get('time') || '') || url.searchParams.get('spp')) return null;
+    const region = url.searchParams.get('r') || 'world';
+    return ['world', BEIJING_REGION].includes(region) ? region : null;
+}
+
+function observationIsInBeijing(obs) {
+    const place = obs.querySelector('.Observation-meta-location');
+    if (!place) return false;
+    return /\bCN-11\b/i.test(place.textContent) || [...place.querySelectorAll('a[href]')]
+        .some(link => new URL(link.href).searchParams.get('r') === BEIJING_REGION);
+}
+
+function updateSpeciesFromLifelistPage(region) {
+    const previous = speciesMap(region === BEIJING_REGION ? loadBeijingSpecies() : loadSpeciesList());
+    const world = region === BEIJING_REGION ? speciesMap(loadSpeciesList()) : new Map();
+    const beijing = region === BEIJING_REGION ? new Map() : speciesMap(loadBeijingSpecies());
+    const page = region === BEIJING_REGION ? beijing : world;
+
+    for (const obs of document.querySelectorAll('section#nativeNatProv .Observation')) {
+        const el = obs.querySelector('.Heading-main');
+        const rawName = el?.textContent.trim();
+        if (!rawName) continue;
+        const latinName = obs.querySelector('.Heading-sub--sci')?.textContent.trim() || '';
+        if (isNonSpecies(el, rawName, latinName)) continue;
+        const name = speciesName(rawName.replace(/\([^)]*\)\*?$/, '').trim(), latinName, speciesCode(el));
+        page.set(name, latinName);
+        if (region === 'world' && !previous.has(name) && observationIsInBeijing(obs)) {
+            beijing.set(name, latinName);
+        }
     }
 
-    // 1) 从当前 section 收集物种（去重）
-    const pageMap = new Map(); // commonName -> latinName
-    scope.querySelectorAll('.Observation').forEach(obs => {
-        const commonNameEl = obs.querySelector('.Heading-main');
-        const latinNameEl = obs.querySelector('.Heading-sub--sci');
-        if (!commonNameEl) return;
-
-        const commonNameRaw = commonNameEl.textContent.trim();
-        const commonName = commonNameRaw.replace(/\(.*?\)\*?$/, '').trim();
-        const latinName = (latinNameEl?.textContent.trim() || '');
-
-        if (!pageMap.has(commonName)) {
-            pageMap.set(commonName, latinName);
-        }
-    });
-
-    // 页面上一个都没抓到，多半是还没加载完，不能拿它覆盖本地列表
-    if (pageMap.size === 0) {
+    if (!page.size) {
         console.warn('[eBird Species Tracker] 页面上未找到物种，已跳过更新。');
         return;
     }
 
-    // 2) 计算新增与删除
-    const pageSet = new Set(pageMap.keys());
-    let added = 0, removed = 0;
+    let added = 0;
+    let removed = 0;
+    for (const name of page.keys()) if (!previous.has(name)) added++;
+    for (const name of previous.keys()) if (!page.has(name) && (region !== 'world' || !beijing.has(name))) removed++;
 
-    for (const name of pageSet) {
-        if (!existingSet.has(name)) added++;
+    for (const [name, latinName] of beijing) {
+        if (!world.has(name)) world.set(name, latinName);
     }
-    for (const name of existingSet) {
-        if (!pageSet.has(name)) removed++;
+    saveSpeciesList(sortedSpecies(world));
+    localStorage.setItem(BEIJING_STORAGE_KEY, JSON.stringify(sortedSpecies(beijing)));
+    if (added || removed) {
+        const changes = [added && `新增 ${added}`, removed && `删除 ${removed}`].filter(Boolean);
+        alert(`已与${region === BEIJING_REGION ? '北京' : '全球'}生涯清单对齐：${changes.join('，')} 个物种。`);
     }
-
-    // 3) 以页面为准重建并保存
-    const updatedList = Array.from(pageMap, ([commonName, latinName]) => ({ commonName, latinName }))
-        .sort((a, b) => a.commonName.localeCompare(b.commonName));
-
-    saveSpeciesList(updatedList);
-
-    // 4) 反馈
-    if (added > 0 || removed > 0) {
-        const parts = [];
-        if (added) parts.push(`新增 ${added}`);
-        if (removed) parts.push(`删除 ${removed}`);
-        alert(`已与当前生涯清单对齐：${parts.join('，')} 个物种。`);
-    }
-
-    // console.log(`[eBird Species Tracker] Total species in list: ${updatedList.length}`);
 }
 
 function getRelevantElements() {
@@ -143885,18 +143922,18 @@ function ensureHighlightCSS() {
     style.id = 'ebird-highlights';
     style.textContent = `
 /* 祖先打标，所有后代全部强制变色 */
-[data-ebird-unseen],
-[data-ebird-unseen] *,
-[data-ebird-unseen] a,
-[data-ebird-unseen] a:link,
-[data-ebird-unseen] a:visited {
+[data-ebird-status],
+[data-ebird-status] *,
+[data-ebird-status] a,
+[data-ebird-status] a:link,
+[data-ebird-status] a:visited {
   color: var(--ebird-highlight, #ff2d55) !important;
   -webkit-text-fill-color: var(--ebird-highlight, #ff2d55) !important; /* WebKit 有时用这个覆盖文字颜色 */
 }
 
 /* 如果页面是 SVG 文本 */
-[data-ebird-unseen] svg text,
-[data-ebird-unseen] svg tspan {
+[data-ebird-status] svg text,
+[data-ebird-status] svg tspan {
   fill: var(--ebird-highlight, #ff2d55) !important;
 }
 `;
@@ -143904,69 +143941,74 @@ function ensureHighlightCSS() {
     (document.head || document.documentElement).appendChild(style);
 }
 
-/**
- * 在各类 eBird 页面上高亮未见过的鸟种。
- * 会跳过 sp./hybrid/slash 等无效条目。
- */
+function isBeijingPage() {
+    return /CN-11/i.test(location.href) || /Beijing/i.test(document.title) ||
+        /Beijing/i.test(document.body.innerText ?? document.body.textContent);
+}
+
 function highlightUnseenSpecies() {
-    const seenBirds = new Set(loadSpeciesList().map(s => s.commonName));
-    // console.log(`[eBird] 当前已见鸟种数量: ${seenBirds.size}`);
+    const targets = ENABLE_PARTIAL_MATCH ? getRelevantElements() : [];
+    if (!targets.length) return;
+    const inBeijing = isBeijingPage();
+    const seenWorld = speciesMap(loadSpeciesList());
+    const seenBeijing = inBeijing ? speciesMap(loadBeijingSpecies()) : new Map();
 
-    let targets = [];
-    if (ENABLE_PARTIAL_MATCH) {
-        targets = getRelevantElements();
+    for (const el of targets) {
+        const previous = markedSet.get(el);
+        const star = previous?.star;
+        const rawName = el.textContent.trim();
+        const commonName = el.querySelector('.Species-common, .SpecimenHeader-name, .Heading-main')?.textContent.trim() || rawName;
+        const latinName = (el.querySelector(SCIENTIFIC_NAME_SELECTOR) ||
+            el.parentElement?.querySelector(SCIENTIFIC_NAME_SELECTOR) ||
+            el.closest('.Observation-species, .Species, .SpecimenHeader')?.querySelector(SCIENTIFIC_NAME_SELECTOR))?.textContent.trim() || '';
+        const code = speciesCode(el);
+        const name = speciesName(extractCleanName(commonName.replace(/\s*\*$/, '')), latinName, code);
+        const nonSpecies = isNonSpecies(el, commonName, latinName);
+        const signature = JSON.stringify([commonName.replace(/\*$/, ''), latinName, code, inBeijing, nonSpecies,
+            seenWorld.has(name), seenBeijing.has(name)]);
+        if (signature === previous?.signature) continue;
+        if (star?.parentNode === el) star.remove();
+        if (previous?.endemicTitle && el.title === previous.endemicTitle) el.title = previous.originalTitle;
+        el.removeAttribute('data-ebird-status');
+        el.removeAttribute('data-ebird-unseen');
+        el.removeAttribute('data-ebird-endemic');
+        el.style.removeProperty('--ebird-highlight');
+
+        const state = { signature };
+        markedSet.set(el, state);
+        const worldNew = !seenWorld.has(name) && !seenBeijing.has(name);
+        const beijingNew = inBeijing && !seenBeijing.has(name) && !worldNew;
+        if (!nonSpecies && !worldNew && !beijingNew) continue;
+
+        ensureHighlightCSS();
+        el.setAttribute('data-ebird-status', nonSpecies ? 'non-species' : worldNew ? 'world-new' : 'beijing-new');
+        if (nonSpecies) {
+            el.style.setProperty('--ebird-highlight', '#000000');
+            continue;
+        }
+        if (beijingNew) {
+            el.style.setProperty('--ebird-highlight', BEIJING_NEW_COLOR);
+            continue;
+        }
+
+        const countryCode = Object.hasOwn(endemicMap, name) ? endemicMap[name] : '';
+        el.setAttribute('data-ebird-unseen', '1');
+        el.setAttribute('data-ebird-endemic', countryCode ? '1' : '0');
+        el.style.setProperty('--ebird-highlight',
+            !inBeijing && countryCode && HIGHLIGHT_ENDEMIC ? ENDEMIC_HIGHLIGHT_COLOR : HIGHLIGHT_COLOR);
+        if (!inBeijing && countryCode && HIGHLIGHT_ENDEMIC && !/Endemic \([A-Z]{2}\)/.test(el.title)) {
+            state.originalTitle = el.title;
+            state.endemicTitle = `${el.title ? `${el.title} | ` : ''}Endemic (${countryCode})`;
+            el.title = state.endemicTitle;
+        }
+        if (!el.textContent.includes('*')) {
+            state.star = document.createTextNode('*');
+            el.appendChild(state.star);
+        }
     }
-    /*if (ENABLE_FULL_MATCH || targets.length === 0) {
-        targets = document.querySelectorAll('.Heading-main');
-        console.log(`[eBird] fallback 使用 .Heading-main 匹配元素数量: ${targets.length}`);
-    }*/
-
-    // console.log(`[eBird] 最终处理元素数量: ${targets.length}`);
-
-    targets.forEach(el => {
-        if (markedSet.has(el)) return; // ✅ 避免重复处理
-
-        const rawText = el.textContent.trim();
-        const cleanName = extractCleanName(rawText);
-
-        // 去除 spuh/hybrid/slash
-        if (cleanName.endsWith(' sp.') || cleanName.includes(' x ') || cleanName.includes(' X ') || cleanName.includes('/')) {
-            markedSet.add(el);
-            return;
-        }
-
-        if (!seenBirds.has(cleanName)) {
-            ensureHighlightCSS(); // 保证样式注入
-
-            const countryCode = endemicMap[cleanName];
-            const isEndemic = !!countryCode;
-            el.setAttribute('data-ebird-unseen', '1');
-            el.setAttribute('data-ebird-endemic', isEndemic ? '1' : '0');
-            el.style.setProperty('--ebird-highlight',
-                isEndemic && HIGHLIGHT_ENDEMIC ? ENDEMIC_HIGHLIGHT_COLOR : HIGHLIGHT_COLOR);
-            if (isEndemic && HIGHLIGHT_ENDEMIC) {
-                if (!el.title) el.title = `Endemic (${countryCode})`;
-                else if (!/Endemic \([A-Z]{2}\)/.test(el.title)) el.title += ` | Endemic (${countryCode})`;
-            }
-
-            // 在末尾补一个星标（保留你原逻辑）
-            if (!rawText.includes('*')) {
-                el.appendChild(document.createTextNode('*'));
-            }
-        }
-
-        markedSet.add(el);
-    });
 }
 
-/** lifelist 页面专用：只同步物种，不做 DOM 替换 */
-function isLifelistPage() {
-    const url = new URL(location.href);
-    return url.origin === 'https://ebird.org' &&
-        /^\/lifelist\/?$/.test(url.pathname) &&
-        ['', 'life'].includes(url.searchParams.get('time') || '') &&
-        ['', 'world'].includes(url.searchParams.get('r') || '');
-}
+const SCIENTIFIC_NAME_SELECTOR = '.Heading-sub--sci, .Species-sci, .SpecimenHeader-sci, .SciName, [data-scientific-name]';
 
 /**
  * 等生涯清单的物种数连续几次不再变化后再回调，代替固定延时；
@@ -143997,9 +144039,12 @@ function onPageLoad(callback) {
 
 /** 非 lifelist 页面在 load 后启动高亮 + MutationObserver */
 function bootstrapHighlighting() {
-    if (isLifelistPage()) {
+    const region = lifelistRegion();
+    if (region) {
         onPageLoad(() => {
-            whenLifelistStable(updateSpeciesFromLifelistPage);
+            whenLifelistStable(() => {
+                if (lifelistRegion() === region) updateSpeciesFromLifelistPage(region);
+            });
         });
         return;
     }
@@ -144015,6 +144060,7 @@ function bootstrapHighlighting() {
 
             observer.observe(document.body, {
                 childList: true,
+                characterData: true,
                 subtree: true
             });
         }, 4000);

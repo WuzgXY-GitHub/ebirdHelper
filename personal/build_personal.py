@@ -14,8 +14,8 @@ pinyin = json.loads((ROOT / 'pinyin_mapping.json').read_text(encoding='utf-8'))
 header = '''// ==UserScript==
 // @name         eBird 添加中文鸟名（个人内嵌版）
 // @namespace    http://tampermonkey.net/
-// @version      2.1.1-personal.1
-// @description  中文鸟名、拼音搜索及未见鸟种高亮；保留一国特有种，无远程数据请求
+// @version      2.1.1-personal.2
+// @description  中文鸟名、拼音搜索及全球和北京新种高亮，数据内嵌
 // @match        https://ebird.org/*
 // @grant        GM.getValue
 // @downloadURL  none
@@ -44,24 +44,20 @@ begin = source.index('const RAW_BASE =')
 end = source.index('const birdNamePattern =')
 source = source[:begin] + data + '\n\n' + helpers + source[end:]
 
-begin = source.index('    // 删除前先确认：')
-end = source.index('    // 3) 以页面为准重建并保存', begin)
-source = source[:begin] + source[end:]
+begin = source.index('/**\n * 解析生涯列表页面')
+end = source.index('function getRelevantElements()', begin)
+source = source[:begin] + (PERSONAL / 'lifelist.js').read_text(encoding='utf-8') + '\n' + source[end:]
 
-old_highlight = """            el.setAttribute('data-ebird-unseen', '1');
-            el.style.setProperty('--ebird-highlight', HIGHLIGHT_COLOR);"""
-new_highlight = """            const countryCode = endemicMap[cleanName];
-            const isEndemic = !!countryCode;
-            el.setAttribute('data-ebird-unseen', '1');
-            el.setAttribute('data-ebird-endemic', isEndemic ? '1' : '0');
-            el.style.setProperty('--ebird-highlight',
-                isEndemic && HIGHLIGHT_ENDEMIC ? ENDEMIC_HIGHLIGHT_COLOR : HIGHLIGHT_COLOR);
-            if (isEndemic && HIGHLIGHT_ENDEMIC) {
-                if (!el.title) el.title = `Endemic (${countryCode})`;
-                else if (!/Endemic \\([A-Z]{2}\\)/.test(el.title)) el.title += ` | Endemic (${countryCode})`;
-            }"""
-assert source.count(old_highlight) == 1
-source = source.replace(old_highlight, new_highlight, 1)
+begin = source.index('/**\n * 在各类 eBird 页面')
+end = source.index('/**\n * 等生涯清单', begin)
+source = source[:begin] + (PERSONAL / 'highlight.js').read_text(encoding='utf-8') + '\n' + source[end:]
+source = source.replace('new WeakSet();', 'new WeakMap();', 1)
+source = source.replace('[data-ebird-unseen]', '[data-ebird-status]')
+source = source.replace('if (isLifelistPage()) {', 'const region = lifelistRegion();\n    if (region) {')
+source = source.replace('whenLifelistStable(updateSpeciesFromLifelistPage);',
+                        'whenLifelistStable(() => {\n                if (lifelistRegion() === region) updateSpeciesFromLifelistPage(region);\n            });')
+source = source.replace('                childList: true,\n                subtree: true',
+                        '                childList: true,\n                characterData: true,\n                subtree: true', 1)
 
 begin = source.index('    const URL_MAPPING =')
 end = source.index('    // lowerName', begin)
