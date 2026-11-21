@@ -3,6 +3,7 @@
 
 ["birdMap.json"]
 source = "names/birdMap.json"
+# sha256 records the upstream snapshot. This fork applies local Han-character substitutions.
 sha256 = "1316ca9d87a24587bc19b6a21890b14541715d0d5cbab92fd0198ca1fe8a0a84"
 commit = "fe2e9bb14dfb2de924f5b93774cc610e638b36ca"
 
