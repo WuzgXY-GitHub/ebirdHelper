@@ -46,7 +46,7 @@ test('hotspot：英文名后加中文名，未见鸟种加星号高亮，已见�
         assert.equal(duck.getAttribute('data-ebird-unseen'), '1');
         assert.equal(shoveler.getAttribute('data-ebird-unseen'), '1');
         assert.equal(duck.style.getPropertyValue('--ebird-highlight'), '#A35F00');
-        assert.equal(duck.hasAttribute('data-ebird-endemic'), false);
+        assert.equal(duck.getAttribute('data-ebird-endemic'), '0');
 
         assert.equal(coot.textContent, birdMap['American Coot']);
         assert.equal(coot.hasAttribute('data-ebird-unseen'), false);
@@ -72,60 +72,20 @@ test('单文件版本的 @name 与主脚本不同，Tampermonkey 里能区分', 
     assert.equal(new Set(names).size, 3, names.join(' / '));
 });
 
-// ---------- 问题 2：@grant 与首次加载 ----------
+// ---------- 内嵌数据与更新设置 ----------
 
-test('首次加载（无缓存）：数据能拉下来并写入 GM 缓存', async () => {
-    const page = await openPage(HOTSPOT);
-    try {
-        assert.equal(page.scriptError, null);
-        assert.ok(page.gmStore.has('ebh_cn_map_cache_v1'), 'birdMap 应写入缓存');
-        assert.deepEqual(page.requests.filter(r => !/\/(birdMap|pinyin_mapping)\.json$/.test(r.url)), []);
-    } finally {
-        page.close();
-    }
-});
-
-test('第二次加载：命中缓存，后台带 If-None-Match 刷新拿到 304', async () => {
-    const gmStore = new Map();
-    (await openPage({ ...HOTSPOT, gmStore })).close();
-
-    const page = await openPage({ ...HOTSPOT, gmStore });
-    try {
-        await sleep(50);
-        assert.equal(page.scriptError, null);
-        const refresh = page.requests.filter(r => r.url.endsWith('birdMap.json'));
-        assert.equal(refresh.length, 1);
-        assert.ok(refresh[0].headers['If-None-Match']);
-        assert.equal(refresh[0].status, 304);
-    } finally {
-        page.close();
-    }
-});
-
-// ---------- 网络请求：页面 CSP 拦截 fetch，必须走 GM.xmlHttpRequest ----------
-
-test('所有 GitHub 请求都走 GM.xmlHttpRequest，不用 fetch', async () => {
-    for (const where of [HOTSPOT, SUBMIT]) {
-        const page = await openPage(where);
+test('原有三个脚本均关闭自动更新，内嵌数据无需网络请求', async () => {
+    for (const file of ['eBirdHelper.js', 'eBirdHelperSingleFile.js', 'eBirdHelperSingleFile.dev.js']) {
+        const source = readSource(file);
+        assert.match(source, /^\/\/ @downloadURL\s+none$/m);
+        assert.doesNotMatch(source, /^\/\/\s*@(updateURL|connect)\b/m);
+        const page = await openPage({ ...HOTSPOT, source });
         try {
-            await sleep(100);
             assert.equal(page.scriptError, null);
-            assert.ok(page.requests.length > 0);
-            assert.deepEqual(page.requests.filter(r => r.via !== 'GM.xmlHttpRequest'), []);
+            assert.deepEqual(page.requests, []);
         } finally {
             page.close();
         }
-    }
-});
-
-test('没有 @connect raw.githubusercontent.com 时首次加载失败（确认测试框架会拦）', async () => {
-    const source = readSource().replace(/^\/\/\s*@connect.*\r?\n/m, '');
-    assert.doesNotMatch(source, /^\/\/\s*@connect/m);
-    const page = await openPage({ ...HOTSPOT, source });
-    try {
-        assert.match(String(page.scriptError), /Request failed/);
-    } finally {
-        page.close();
     }
 });
 
@@ -145,13 +105,10 @@ async function openSubmitWithPinyin() {
     return page;
 }
 
-test('@pinyin：从当前分支加载 pinyin_mapping.json，并出现候选', async () => {
+test('@pinyin：用内嵌拼音数据生成候选', async () => {
     const page = await openSubmitWithPinyin();
     try {
-        const req = page.requests.find(r => r.url.endsWith('pinyin_mapping.json'));
-        assert.ok(req, '应请求 pinyin_mapping.json');
-        assert.match(req.url, /\/ebirdHelper\/main\/pinyin_mapping\.json$/);
-        assert.equal(req.status, 200);
+        assert.deepEqual(page.requests, []);
 
         await typeInJump(page, '@' + pinyin['Mallard'].pinyin);
         const items = page.document.querySelectorAll('.__pinyin-item');
@@ -285,32 +242,17 @@ for (const url of [
 test('生涯清单为空：不覆盖本地列表', async () => {
     const page = await openPage({
         url: LIFELIST_URL, html: fixture('lifelist.html'), speed: 40,
+        source: readSource().replace('maxWaitMs = 20000', 'maxWaitMs = 100'),
         localStorage: { ebirdSpeciesList: asSaved(LIFE) },
     });
     try {
-        await sleep(700); // 20s 上限 / 40 倍速
+        for (let i = 0; i < 60 && !page.logs.some(row => String(row[1]).includes('页面上未找到物种')); i++) await sleep(50);
+        assert.ok(page.logs.some(row => String(row[1]).includes('页面上未找到物种')));
         assert.deepEqual(page.savedSpecies(), asSaved(LIFE));
     } finally {
         page.close();
     }
 });
-
-for (const [answer, expected] of [[true, LIFE], [false, [...LIFE, ['Dodo', 'Raphus cucullatus']]]]) {
-    test(`生涯清单：本地多出的物种，confirm 选${answer ? '确定则删除' : '取消则保留'}`, async () => {
-        const page = await openPage({
-            url: LIFELIST_URL, html: fixture('lifelist.html'), speed: 10, confirm: () => answer,
-            localStorage: { ebirdSpeciesList: asSaved([...LIFE, ['Dodo', 'Raphus cucullatus']]) },
-        });
-        try {
-            addToLifelist(page.document, LIFE);
-            await sleep(400);
-            assert.equal(page.dialogs.filter(d => d[0] === 'confirm').length, 1);
-            assert.deepEqual(page.savedSpecies(), asSaved(expected));
-        } finally {
-            page.close();
-        }
-    });
-}
 
 test('脚本在 load 之后才启动时，生涯清单仍会同步', async () => {
     const page = await openPage({
@@ -319,9 +261,126 @@ test('脚本在 load 之后才启动时，生涯清单仍会同步', async () =>
     });
     try {
         addToLifelist(page.document, LIFE);
-        await sleep(400);
+        await waitFor(() => page.savedSpecies().length === LIFE.length);
         assert.deepEqual(page.savedSpecies(), asSaved(LIFE));
     } finally {
         page.close();
+    }
+});
+
+// ---------- 北京清单与鸟种颜色 ----------
+
+async function waitFor(predicate) {
+    for (let i = 0; i < 60; i++) {
+        if (predicate()) return;
+        await sleep(50);
+    }
+    assert.ok(predicate(), 'Timed out waiting for script behavior');
+}
+
+test('未见特有种红色及国家提示，普通种橙色，已见种不高亮；无需联网', async () => {
+    const page = await openPage({
+        url: 'https://ebird.org/hotspot/L1', afterLoad: true,
+        html: '<style>.Species-common { font-weight: bold }</style><body><span class="Species-common">Maleo</span><span class="Species-common">Mallard</span><span class="Species-common">Emu</span></body>',
+        localStorage: { ebirdSpeciesList: [{ commonName: 'Emu', latinName: 'Dromaius novaehollandiae' }] },
+    });
+    try {
+        assert.equal(page.scriptError, null);
+        const [endemic, normal, seen] = page.document.querySelectorAll('.Species-common');
+        await waitFor(() => endemic.hasAttribute('data-ebird-unseen'));
+        assert.equal(endemic.style.getPropertyValue('--ebird-highlight'), '#C0262E');
+        assert.equal(endemic.title, 'Endemic (ID)');
+        assert.equal(endemic.getAttribute('data-ebird-endemic'), '1');
+        assert.equal(normal.style.getPropertyValue('--ebird-highlight'), '#A35F00');
+        assert.equal(seen.hasAttribute('data-ebird-unseen'), false);
+        assert.match(endemic.textContent, /\(.*\).*\*/);
+        assert.deepEqual(page.requests, []);
+    } finally { page.close(); }
+});
+
+test('生涯清单直接删除本地多余种，不弹确认；接纳斜杠、乱序参数及其他参数', async () => {
+    const page = await openPage({
+        url: 'https://ebird.org/lifelist/?sortBy=date&r=world&time=life',
+        html: fixture('lifelist.html'), afterLoad: true,
+        localStorage: { ebirdSpeciesList: [{ commonName: 'Dodo', latinName: 'Raphus cucullatus' }] },
+        confirm: () => { throw new Error('Must not ask for confirmation'); },
+    });
+    try {
+        page.document.querySelector('#nativeNatProv').innerHTML = lifeRow('Mallard', 'Anas platyrhynchos');
+        await waitFor(() => page.savedSpecies()?.[0]?.commonName === 'Mallard');
+        assert.deepEqual(page.savedSpecies(), [{ commonName: 'Mallard', latinName: 'Anas platyrhynchos' }]);
+        assert.deepEqual(page.dialogs.map(x => x[0]), ['alert']);
+        assert.deepEqual(page.requests, []);
+    } finally { page.close(); }
+});
+
+const beijKey = 'ebirdSpeciesListCN-11';
+const record = (commonName, latinName) => ({ commonName, latinName });
+const mallard = record('Mallard', 'Anas platyrhynchos');
+const emu = record('Emu', 'Dromaius novaehollandiae');
+const coot = record('American Coot', 'Fulica americana');
+
+function lifeRow(commonName, latinName, code = '', place = '') {
+    return `<div class="Observation"><a data-species-code="${code}"><span class="Heading-main" style="font-weight: 700">${commonName}</span>` +
+        `<span class="Heading-sub--sci">${latinName}</span></a>${place}</div>`;
+}
+
+const beijingLocation = '<div class="Observation-meta-location"><a href="/lifelist?r=CN-11&amp;time=life">CN-11</a></div>';
+const loadBeijing = page => JSON.parse(page.window.localStorage.getItem(beijKey));
+
+test('北京清单替换自身，并按物种代码把中文页面里的新种加入全球清单', async () => {
+    const page = await openPage({ url: 'https://ebird.org/lifelist?time=life&r=CN-11&continue',
+        html: fixture('lifelist.html'), afterLoad: true,
+        localStorage: { ebirdSpeciesList: [emu], [beijKey]: [coot] },
+    });
+    try {
+        page.document.querySelector('#nativeNatProv').innerHTML = lifeRow('绿头鸭', mallard.latinName, 'mallar3');
+        await waitFor(() => loadBeijing(page)?.[0]?.commonName === mallard.commonName);
+        assert.deepEqual(loadBeijing(page), [mallard]);
+        assert.deepEqual(page.savedSpecies(), [emu, mallard]);
+    } finally { page.close(); }
+});
+
+test('全球清单只用新增物种自己的地点补北京清单', async () => {
+    const elsewhere = '<div class="Observation-meta-location"><a href="/lifelist?r=CN-12">CN-12</a></div>' +
+        '<div class="Observation-tools"><a href="/lifelist?r=CN-11&amp;spp=amecoo">查看全部</a></div>';
+    const page = await openPage({ url: 'https://ebird.org/lifelist', html: fixture('lifelist.html'), afterLoad: true,
+        localStorage: { ebirdSpeciesList: [emu] },
+    });
+    try {
+        page.document.querySelector('#nativeNatProv').innerHTML = lifeRow(mallard.commonName, mallard.latinName, 'mallar3', beijingLocation) +
+            lifeRow(coot.commonName, coot.latinName, 'amecoo', elsewhere) + lifeRow(emu.commonName, emu.latinName, 'emu1', beijingLocation);
+        await waitFor(() => page.savedSpecies().length === 3);
+        assert.deepEqual(loadBeijing(page), [mallard]);
+    } finally { page.close(); }
+});
+
+test('北京页面配色区分全球新种、北京新种、北京已见及非物种条目', async () => {
+    const names = [
+        ['Mallard', mallard.latinName, '700'], ['American Coot', coot.latinName, '700'], ['Emu', emu.latinName, '700'],
+        ['未识别的鹀', '', '700'], ['spuh', 'Anas sp.', '700'], ['slash', 'Anas platyrhynchos/Anas crecca', '700'],
+        ['plain', '', '400'], ['scientific hybrid', 'Anas platyrhynchos x crecca', '700'],
+        ['乘号 × 杂交', '', '700'], ['某鸭(杂交)', '', '700'],
+    ];
+    const listing = names.map(([name, latin, weight], i) => `<div class="Species" id="bird-${i}"><span class="Species-common" style="font-weight:${weight};color:blue">${name}</span><span class="Species-sci">${latin}</span></div>`).join('');
+    for (const [url, heading] of [['https://ebird.org/region/CN-11', '观鸟'], ['https://ebird.org/hotspot/L1', 'Beijing']]) {
+        const page = await openPage({ url, html: `<h1>${heading}</h1>${listing}`, afterLoad: true,
+            localStorage: { ebirdSpeciesList: [coot, emu], [beijKey]: [emu] },
+        });
+        try {
+            const [worldNew, beijingNew, seen, ...nonSpecies] = page.document.querySelectorAll('.Species-common');
+            await waitFor(() => worldNew.dataset.ebirdStatus === 'world-new');
+            assert.equal(worldNew.style.getPropertyValue('--ebird-highlight'), '#A35F00');
+            assert.match(worldNew.textContent, /\*$/);
+            assert.equal(beijingNew.style.getPropertyValue('--ebird-highlight'), '#16734B');
+            assert.doesNotMatch(beijingNew.textContent, /\*$/);
+            assert.equal(seen.style.color, 'blue');
+            assert.equal(seen.dataset.ebirdStatus, undefined);
+            for (const el of nonSpecies) {
+                assert.equal(el.dataset.ebirdStatus, 'non-species', el.textContent);
+                assert.equal(el.style.getPropertyValue('--ebird-highlight'), '#000000');
+                assert.doesNotMatch(el.textContent, /\*$/);
+            }
+        } finally { page.close(); }
     }
 });

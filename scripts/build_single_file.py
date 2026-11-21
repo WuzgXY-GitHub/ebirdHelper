@@ -1,7 +1,4 @@
-"""
-Build single-file userscripts by inlining the bird name map and rewriting
-metadata/remote URLs to a given branch (main or dev).
-"""
+"""Build the two userscript variants and Chrome extensions from eBirdHelper.js."""
 
 from __future__ import annotations
 
@@ -12,8 +9,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE = ROOT / "eBirdHelper.js"
-INLINE_START = "// @ebh-inline-data-start"
-INLINE_END = "// @ebh-inline-data-end"
 
 
 def read_json(name: str) -> object:
@@ -25,56 +20,17 @@ def parse_version(source_text: str) -> str:
     return m.group(1) if m else "0.0.0"
 
 
-def build_inline_block(bird_map: object) -> str:
-    return "\n".join(
-        [
-            INLINE_START,
-            f"const birdMap = {json.dumps(bird_map, ensure_ascii=False, indent=4)};",
-            INLINE_END,
-        ]
-    )
-
-
-def apply_inline_data(source: str, inline_block: str) -> str:
-    pattern = re.compile(
-        rf"{re.escape(INLINE_START)}[\s\S]*?{re.escape(INLINE_END)}",
-        flags=re.MULTILINE,
-    )
-    if not pattern.search(source):
-        raise RuntimeError("Inline marker block not found in eBirdHelper.js")
-    return pattern.sub(inline_block, source, count=1)
-
-
-def rewrite_urls_for_branch(
-    text: str,
-    branch: str,
-    bundle_name: str | None,
-    update_download: bool = True,
-) -> str:
-    base = f"https://raw.githubusercontent.com/wzy0421/ebirdHelper/{branch}/"
-    single_file_url = base + bundle_name if bundle_name else None
-
-    if update_download and single_file_url:
-        text = re.sub(
-            r"//\s*@updateURL.*",
-            f"// @updateURL  {single_file_url}",
-            text,
-            count=1,
-        )
-        text = re.sub(
-            r"//\s*@downloadURL.*",
-            f"// @downloadURL  {single_file_url}",
-            text,
-            count=1,
-        )
-
-    text = re.sub(
-        r"const RAW_BASE = 'https://raw.githubusercontent.com/wzy0421/ebirdHelper/[^']*/';",
-        f"const RAW_BASE = '{base}';",
-        text,
-        count=1,
-    )
-    return text
+def refresh_inline_data(source: str) -> str:
+    for name, path in [('birdMap', 'birdMap.json'), ('pinyin_map', 'pinyin_mapping.json')]:
+        start = f"// @ebh-inline-{name}-start"
+        end = f"// @ebh-inline-{name}-end"
+        pattern = rf"{re.escape(start)}[\s\S]*?{re.escape(end)}"
+        value = json.dumps(read_json(path), ensure_ascii=False, indent=4)
+        block = f"{start}\nconst {name} = {value};\n{end}"
+        source, count = re.subn(pattern, lambda _: block, source, count=1)
+        if count != 1:
+            raise RuntimeError(f"Inline marker block for {name} not found in eBirdHelper.js")
+    return source
 
 
 def rename_script(text: str, suffix: str) -> str:
@@ -94,33 +50,13 @@ def strip_userscript_header(text: str) -> str:
     )
 
 
-def inject_gm_shim(text: str) -> str:
-    shim = """\n// Minimal GM storage shim for extension build\nconst GM = {\n  async getValue(key, defaultValue = null) {\n    const raw = localStorage.getItem(key);\n    if (raw === null) return defaultValue;\n    try { return JSON.parse(raw); } catch (_) { return raw; }\n  },\n  async setValue(key, value) {\n    localStorage.setItem(key, JSON.stringify(value));\n  },\n  async deleteValue(key) {\n    localStorage.removeItem(key);\n  },\n  xmlHttpRequest(details) {\n    fetch(details.url, { method: details.method || 'GET', headers: details.headers || {} })\n      .then(async (r) => details.onload && details.onload({\n        status: r.status,\n        statusText: r.statusText,\n        responseText: await r.text(),\n        responseHeaders: [...r.headers].map(([k, v]) => `${k}: ${v}`).join('\\r\\n'),\n      }))\n      .catch((e) => details.onerror && details.onerror(e));\n  },\n};\n"""
-    return shim + "\n" + text
-
-
-def wrap_async_iife(text: str) -> str:
-    return "(async () => {\n" + text + "\n})();\n"
-
-
-def render_bundle(branch: str, bird_map: object, include_meta: bool, bundle_name: str | None) -> str:
-    source = SOURCE.read_text(encoding="utf-8")
-    inline_block = build_inline_block(bird_map)
-    output = apply_inline_data(source, inline_block)
-    output = rewrite_urls_for_branch(output, branch, bundle_name, update_download=include_meta)
-    if not include_meta:
-        output = strip_userscript_header(output)
-    return output
-
-
-def build_single(branch: str, bird_map: object) -> Path:
+def build_single(branch: str, source: str) -> Path:
     bundle_name = "eBirdHelperSingleFile.js" if branch == "main" else "eBirdHelperSingleFile.dev.js"
     dest = ROOT / bundle_name
 
-    output = render_bundle(branch, bird_map, include_meta=True, bundle_name=bundle_name)
-    output = rename_script(output, "（单文件版）" if branch == "main" else "（单文件 dev 版）")
+    output = rename_script(source, "（单文件版）" if branch == "main" else "（单文件 dev 版）")
 
-    dest.write_text(output, encoding="utf-8")
+    dest.write_text(output, encoding="utf-8", newline="\n")
     print(f"Wrote {branch} bundle to {dest}")
     return dest
 
@@ -139,23 +75,17 @@ def write_manifest(dest_dir: Path, version: str, branch: str) -> None:
                 "run_at": "document_idle",
             }
         ],
-        "host_permissions": [
-            "https://raw.githubusercontent.com/*"
-        ],
     }
     dest_dir.mkdir(parents=True, exist_ok=True)
     (dest_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def build_extension(branch: str, bird_map: object, version: str) -> Path:
+def build_extension(branch: str, source: str, version: str) -> Path:
     out_dir = ROOT / "dist" / f"chrome-extension-{branch}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    code = render_bundle(branch, bird_map, include_meta=False, bundle_name=None)
-    code = inject_gm_shim(code)
-    code = wrap_async_iife(code)
-
-    (out_dir / "content.js").write_text(code, encoding="utf-8")
+    code = '(() => {\n' + strip_userscript_header(source) + '\n})();\n'
+    (out_dir / "content.js").write_text(code, encoding="utf-8", newline="\n")
     write_manifest(out_dir, version, branch)
 
     print(f"Wrote Chrome extension ({branch}) to {out_dir}")
@@ -168,7 +98,7 @@ def main() -> None:
         "--branch",
         choices=["main", "dev", "both"],
         default="both",
-        help="Which branch URLs to use (default: both).",
+        help="Which named variants to build (default: both).",
     )
     parser.add_argument(
         "--extension-only",
@@ -178,15 +108,17 @@ def main() -> None:
     args = parser.parse_args()
 
     source_text = SOURCE.read_text(encoding="utf-8")
-    version = parse_version(source_text)
-    bird_map = read_json("birdMap.json")
+    source = refresh_inline_data(source_text)
+    if source != source_text:
+        SOURCE.write_text(source, encoding="utf-8", newline="\n")
+    version = parse_version(source)
 
     branches = ["main", "dev"] if args.branch == "both" else [args.branch]
 
     for br in branches:
         if not args.extension_only:
-            build_single(br, bird_map)
-        build_extension(br, bird_map, version)
+            build_single(br, source)
+        build_extension(br, source, version)
 
 
 if __name__ == "__main__":
